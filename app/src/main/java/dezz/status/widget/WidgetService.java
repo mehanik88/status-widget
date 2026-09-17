@@ -28,6 +28,7 @@ import android.app.usage.UsageStatsManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.res.Configuration;
+import android.database.ContentObserver;
 import android.graphics.Paint;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
@@ -185,6 +186,19 @@ public class WidgetService extends Service implements WidgetHost {
 
     private Context themedContext;
     private int appliedThemePref = -1;
+
+    /**
+     * Fires when {@code top_wall_paper_gray} changes — the same OEM Settings.System key the
+     * stock status bar (com.geely.systemui.plugin.statusbar.StatusBarView#getThemeMode) reads
+     * to decide whether its own icons should be light or dark for the current wallpaper. Only
+     * registered while {@link Preferences#widgetTheme} is in "follow wallpaper" mode.
+     */
+    @Nullable
+    private ContentObserver wallpaperGrayObserver;
+
+    private static final String WALLPAPER_GRAY_SETTING = "top_wall_paper_gray";
+    private static final float WALLPAPER_GRAY_DEFAULT = 128f;
+    private static final int WIDGET_THEME_FOLLOW_WALLPAPER = 4;
 
     /** Fires when the overlay's position or size changes so the settings UI can stay in sync. */
     public interface OverlayStateListener {
@@ -654,15 +668,29 @@ public class WidgetService extends Service implements WidgetHost {
     /**
      * Rebuilds {@link #themedContext} so theme-dependent colour lookups respect the user's
      * "Widget theme" preference. Pref values: 0 = follow system, 1 = always light, 2 = always
-     * dark, 3 = inverse of system. Cached so we don't allocate a new Context on every
-     * {@code applyPreferences()}; {@code onConfigurationChanged} invalidates the cache so the
-     * inverse mode picks up system theme changes too.
+     * dark, 3 = inverse of system, 4 = follow wallpaper (mirrors the stock status bar's own
+     * background-driven icon colour, via the same {@code top_wall_paper_gray} OEM setting).
+     * Cached so we don't allocate a new Context on every {@code applyPreferences()};
+     * {@code onConfigurationChanged} invalidates the cache so the inverse mode picks up system
+     * theme changes too.
      */
     private void updateThemedContext() {
         int pref = prefs.widgetTheme.get();
+        manageWallpaperGrayObserver(pref == WIDGET_THEME_FOLLOW_WALLPAPER);
         if (themedContext != null && pref == appliedThemePref) return;
         if (pref == 0) {
             themedContext = this;
+        } else if (pref == WIDGET_THEME_FOLLOW_WALLPAPER) {
+            // Same threshold the stock status bar uses: gray > 128 means a light enough
+            // background that dark icons/text read better on it.
+            float gray = Settings.System.getFloat(getContentResolver(), WALLPAPER_GRAY_SETTING,
+                    WALLPAPER_GRAY_DEFAULT);
+            int uiMode = gray > WALLPAPER_GRAY_DEFAULT
+                    ? Configuration.UI_MODE_NIGHT_NO
+                    : Configuration.UI_MODE_NIGHT_YES;
+            Configuration cfg = new Configuration(getResources().getConfiguration());
+            cfg.uiMode = (cfg.uiMode & ~Configuration.UI_MODE_NIGHT_MASK) | uiMode;
+            themedContext = createConfigurationContext(cfg);
         } else {
             int uiMode;
             if (pref == 1) {
@@ -681,6 +709,31 @@ public class WidgetService extends Service implements WidgetHost {
             themedContext = createConfigurationContext(cfg);
         }
         appliedThemePref = pref;
+    }
+
+    /**
+     * Starts or stops watching {@code top_wall_paper_gray} for "follow wallpaper" mode. Cheap to
+     * call on every {@link #updateThemedContext()} pass: it no-ops once the observer is already
+     * in the wanted state.
+     */
+    private void manageWallpaperGrayObserver(boolean wanted) {
+        if (wanted == (wallpaperGrayObserver != null)) return;
+        if (wanted) {
+            wallpaperGrayObserver = new ContentObserver(mainHandler) {
+                @Override
+                public void onChange(boolean selfChange) {
+                    // Force a rebuild even though pref hasn't changed — the wallpaper's gray
+                    // value is the whole point of this mode.
+                    appliedThemePref = -1;
+                    applyPreferences();
+                }
+            };
+            getContentResolver().registerContentObserver(
+                    Settings.System.getUriFor(WALLPAPER_GRAY_SETTING), false, wallpaperGrayObserver);
+        } else {
+            getContentResolver().unregisterContentObserver(wallpaperGrayObserver);
+            wallpaperGrayObserver = null;
+        }
     }
 
     private final EnumMap<BrickType, Set<String>> effectiveHideLists = new EnumMap<>(BrickType.class);
@@ -1398,6 +1451,11 @@ public class WidgetService extends Service implements WidgetHost {
     @Override
     public void onDestroy() {
         instance = null;
+
+        if (wallpaperGrayObserver != null) {
+            getContentResolver().unregisterContentObserver(wallpaperGrayObserver);
+            wallpaperGrayObserver = null;
+        }
 
         mainHandler.removeCallbacks(updateDateTimeRunnable);
         mainHandler.removeCallbacks(foregroundAppCheckRunnable);
