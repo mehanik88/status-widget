@@ -59,6 +59,7 @@
         <item>Светлая</item>
         <item>Тёмная</item>
         <item>Инверсная</item>
+        <item>По фону</item>
     </string-array>
 
     <string name="show_date">Показывать дату</string>
