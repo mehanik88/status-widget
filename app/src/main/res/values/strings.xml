@@ -59,6 +59,7 @@
         <item>Light</item>
         <item>Dark</item>
         <item>Inverse</item>
+        <item>Follow wallpaper</item>
     </string-array>
 
     <string name="show_date">Show date</string>
