@@ -28,6 +28,10 @@ import androidx.annotation.Nullable;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import dezz.status.widget.shell.PrivilegedShell;
 
 /**
  * Accessibility service whose sole purpose is to report, for each physical display, which
@@ -44,11 +48,40 @@ import java.util.Map;
 public class WidgetAccessibilityService extends AccessibilityService {
     private static final String TAG = "WidgetA11yService";
 
+    /** Debounce window for {@link #fetchAndParseWindowIconMode()} — TYPE_WINDOWS_CHANGED can
+     * fire in quick bursts (scrolling, keyboard) and dumpsys is relatively heavy to run on
+     * every single one. */
+    private static final long ICON_MODE_DEBOUNCE_MS = 150L;
+
+    private static final Pattern CURRENT_FOCUS_PATTERN =
+            Pattern.compile("mCurrentFocus=Window\\{[0-9a-fA-F]+\\s+u\\d+\\s+([^}]+)\\}");
+    private static final Pattern WINDOW_HEADER_PATTERN =
+            Pattern.compile("Window #\\d+ Window\\{[0-9a-fA-F]+\\s+u\\d+\\s+([^}]+)\\}:");
+    private static final Pattern SYSTEM_UI_VIS_PATTERN =
+            Pattern.compile("mSystemUiVisibility=0x([0-9a-fA-F]+)");
+
     @Nullable
     private static volatile WidgetAccessibilityService instance;
 
     /** displayId → current foreground package. Updated on every window change event. */
     private final Map<Integer, String> foregroundByDisplay = new HashMap<>();
+
+    private final android.os.Handler debounceHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    private final Runnable dumpWindowIconModeRunnable = this::fetchAndParseWindowIconMode;
+
+    /**
+     * -1 = unknown (no data yet, or parsing failed), 0 = neutral, 1 = light background,
+     * 2 = dark background. Same three values
+     * {@code com.geely.systemui.plugin.statusbar.StatusBarView#setIconMode} uses, read from
+     * the currently-focused window's {@code systemUiVisibility} flags — this is the
+     * per-window override the stock status bar applies on top of the wallpaper-luminance
+     * default (see {@link WidgetService}'s "follow wallpaper" theme mode).
+     */
+    private volatile int currentWindowIconMode = -1;
+
+    public int getCurrentWindowIconMode() {
+        return currentWindowIconMode;
+    }
 
     @Nullable
     public static WidgetAccessibilityService getInstance() {
@@ -76,6 +109,8 @@ public class WidgetAccessibilityService extends AccessibilityService {
     @Override
     public void onDestroy() {
         instance = null;
+        debounceHandler.removeCallbacks(dumpWindowIconModeRunnable);
+        currentWindowIconMode = -1;
         synchronized (foregroundByDisplay) {
             foregroundByDisplay.clear();
         }
@@ -115,10 +150,98 @@ public class WidgetAccessibilityService extends AccessibilityService {
         // — there are typically only a handful of accessibility windows in total.
         seedFromCurrentWindows();
 
+        // Debounced: dumpsys is comparatively heavy, and bursts of TYPE_WINDOWS_CHANGED
+        // (scrolling, keyboard) would otherwise trigger it far more often than the icon
+        // mode could plausibly have changed.
+        debounceHandler.removeCallbacks(dumpWindowIconModeRunnable);
+        debounceHandler.postDelayed(dumpWindowIconModeRunnable, ICON_MODE_DEBOUNCE_MS);
+
         WidgetService widget = WidgetService.getInstance();
         if (widget != null) {
             widget.onForegroundDisplayMapUpdated();
         }
+    }
+
+    /**
+     * Runs {@code dumpsys window windows} through the same privileged shell channel used
+     * elsewhere in the app and parses out the focused window's systemUiVisibility flags. See
+     * {@link #parseWindowIconMode} for the parsing strategy and its caveats.
+     */
+    private void fetchAndParseWindowIconMode() {
+        PrivilegedShell.get(this).runCommand("dumpsys window windows", (output, error) -> {
+            if (output == null) return;
+            int mode = parseWindowIconMode(output);
+            if (mode != currentWindowIconMode) {
+                currentWindowIconMode = mode;
+                WidgetService widget = WidgetService.getInstance();
+                if (widget != null) {
+                    widget.onWindowIconModeUpdated();
+                }
+            }
+        });
+    }
+
+    /**
+     * Parses {@code dumpsys window windows} output for the systemUiVisibility flags of the
+     * currently focused window — the same two bits (0x2000 = light, 0x4000 = dark) that
+     * {@code com.geely.systemui.plugin.statusbar.StatusBarView#onWindowChange} reads to decide
+     * whether *its own* icons should be light or dark for whatever app is currently on screen.
+     * <p>
+     * Output format is not strictly standardised across AOSP versions/vendors. Strategy:
+     * locate the {@code mCurrentFocus=Window{... title}} line, find the matching
+     * {@code Window #N Window{... title}:} block among the per-window sections earlier in
+     * the dump, and read {@code mSystemUiVisibility} from inside that specific block. If the
+     * title match fails (format drift on some firmware), fall back to the last
+     * {@code mSystemUiVisibility} value in the whole dump — windows are listed back-to-front
+     * on every build we've seen, so the topmost/focused one tends to be last.
+     * <p>
+     * If this stops matching on a given firmware, log the raw {@code output} once to see the
+     * actual layout and adjust {@link #CURRENT_FOCUS_PATTERN}/{@link #WINDOW_HEADER_PATTERN}.
+     */
+    private static int parseWindowIconMode(String output) {
+        List<String> headerTitles = new java.util.ArrayList<>();
+        List<int[]> headerSpans = new java.util.ArrayList<>(); // [matchStart, matchEnd]
+        Matcher headerMatcher = WINDOW_HEADER_PATTERN.matcher(output);
+        while (headerMatcher.find()) {
+            headerTitles.add(headerMatcher.group(1));
+            headerSpans.add(new int[]{headerMatcher.start(), headerMatcher.end()});
+        }
+
+        Matcher focusMatcher = CURRENT_FOCUS_PATTERN.matcher(output);
+        String focusTitle = focusMatcher.find() ? focusMatcher.group(1) : null;
+
+        Integer visibility = null;
+        if (focusTitle != null) {
+            for (int i = 0; i < headerTitles.size(); i++) {
+                if (!focusTitle.equals(headerTitles.get(i))) continue;
+                int blockStart = headerSpans.get(i)[1];
+                int blockEnd = (i + 1 < headerSpans.size()) ? headerSpans.get(i + 1)[0] : output.length();
+                String block = output.substring(blockStart, Math.min(blockEnd, output.length()));
+                Matcher visMatcher = SYSTEM_UI_VIS_PATTERN.matcher(block);
+                if (visMatcher.find()) {
+                    visibility = Integer.parseInt(visMatcher.group(1), 16);
+                }
+                break;
+            }
+        }
+
+        if (visibility == null) {
+            Matcher visMatcher = SYSTEM_UI_VIS_PATTERN.matcher(output);
+            int last = -1;
+            while (visMatcher.find()) {
+                last = Integer.parseInt(visMatcher.group(1), 16);
+            }
+            if (last == -1) {
+                return -1;
+            }
+            visibility = last;
+        }
+
+        boolean isLight = (visibility & 0x2000) != 0; // View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+        boolean isDark = (visibility & 0x4000) != 0;  // vendor dark-status-bar bit
+        if (isLight) return 1;
+        if (isDark) return 2;
+        return 0;
     }
 
     @Override
