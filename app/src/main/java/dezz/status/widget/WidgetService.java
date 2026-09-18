@@ -681,13 +681,28 @@ public class WidgetService extends Service implements WidgetHost {
         if (pref == 0) {
             themedContext = this;
         } else if (pref == WIDGET_THEME_FOLLOW_WALLPAPER) {
-            // Same threshold the stock status bar uses: gray > 128 means a light enough
-            // background that dark icons/text read better on it.
-            float gray = Settings.System.getFloat(getContentResolver(), WALLPAPER_GRAY_SETTING,
-                    WALLPAPER_GRAY_DEFAULT);
-            int uiMode = gray > WALLPAPER_GRAY_DEFAULT
-                    ? Configuration.UI_MODE_NIGHT_NO
-                    : Configuration.UI_MODE_NIGHT_YES;
+            int windowMode = -1;
+            WidgetAccessibilityService a11y = WidgetAccessibilityService.getInstance();
+            if (a11y != null) {
+                windowMode = a11y.getCurrentWindowIconMode();
+            }
+            int uiMode;
+            if (windowMode == 1) {
+                // Focused window explicitly declared a light background (SYSTEM_UI_FLAG_LIGHT_STATUS_BAR).
+                uiMode = Configuration.UI_MODE_NIGHT_NO;
+            } else if (windowMode == 2) {
+                // Focused window explicitly declared a dark background (vendor dark-status-bar bit).
+                uiMode = Configuration.UI_MODE_NIGHT_YES;
+            } else {
+                // No per-window override known (accessibility service off, or the focused
+                // window declared neither flag) — fall back to the wallpaper-luminance
+                // default, same as the stock status bar does before any window event.
+                float gray = Settings.System.getFloat(getContentResolver(), WALLPAPER_GRAY_SETTING,
+                        WALLPAPER_GRAY_DEFAULT);
+                uiMode = gray > WALLPAPER_GRAY_DEFAULT
+                        ? Configuration.UI_MODE_NIGHT_NO
+                        : Configuration.UI_MODE_NIGHT_YES;
+            }
             Configuration cfg = new Configuration(getResources().getConfiguration());
             cfg.uiMode = (cfg.uiMode & ~Configuration.UI_MODE_NIGHT_MASK) | uiMode;
             themedContext = createConfigurationContext(cfg);
@@ -1166,6 +1181,21 @@ public class WidgetService extends Service implements WidgetHost {
      */
     public void onForegroundTrackingPathChanged() {
         mainHandler.post(this::updateForegroundAppTracking);
+    }
+
+    /**
+     * Called by {@link WidgetAccessibilityService} when the focused window's systemUiVisibility
+     * light/dark flags change. Only matters in "follow wallpaper" theme mode, where it takes
+     * priority over the {@code top_wall_paper_gray} fallback — same precedence the stock status
+     * bar itself gives {@code onWindowChange} over its wallpaper-based default.
+     */
+    public void onWindowIconModeUpdated() {
+        mainHandler.post(() -> {
+            if (prefs.widgetTheme.get() == WIDGET_THEME_FOLLOW_WALLPAPER) {
+                appliedThemePref = -1;
+                applyPreferences();
+            }
+        });
     }
 
     private void checkForegroundApp() {
