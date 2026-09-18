@@ -55,6 +55,20 @@ public class WidgetAccessibilityService extends AccessibilityService {
 
     private static final Pattern CURRENT_FOCUS_PATTERN =
             Pattern.compile("mCurrentFocus=Window\\{[0-9a-fA-F]+\\s+u\\d+\\s+([^}]+)\\}");
+    /**
+     * Fallback #1 for firmware that doesn't print {@code mCurrentFocus} at all (confirmed on
+     * one Cityray build — see git history). "The window currently obscuring the others" is,
+     * in practice, the topmost visible one.
+     */
+    private static final Pattern OBSCURING_WINDOW_PATTERN =
+            Pattern.compile("mObscuringWindow=Window\\{[0-9a-fA-F]+\\s+u\\d+\\s+([^}]+)\\}");
+    /**
+     * Fallback #2: the window currently receiving IME input. Not a perfect proxy for "topmost
+     * visible window" (it can lag behind if nothing has focused a text field recently), but
+     * better than nothing when neither of the above is present.
+     */
+    private static final Pattern INPUT_TARGET_PATTERN =
+            Pattern.compile("mInputMethodInputTarget in display# \\d+ Window\\{[0-9a-fA-F]+\\s+u\\d+\\s+([^}]+)\\}");
     private static final Pattern WINDOW_HEADER_PATTERN =
             Pattern.compile("Window #\\d+ Window\\{[0-9a-fA-F]+\\s+u\\d+\\s+([^}]+)\\}:");
     private static final Pattern SYSTEM_UI_VIS_PATTERN =
@@ -183,20 +197,31 @@ public class WidgetAccessibilityService extends AccessibilityService {
 
     /**
      * Parses {@code dumpsys window windows} output for the systemUiVisibility flags of the
-     * currently focused window — the same two bits (0x2000 = light, 0x4000 = dark) that
-     * {@code com.geely.systemui.plugin.statusbar.StatusBarView#onWindowChange} reads to decide
-     * whether *its own* icons should be light or dark for whatever app is currently on screen.
+     * currently focused/topmost window — the same two bits (0x2000 = light, 0x4000 = dark)
+     * that {@code com.geely.systemui.plugin.statusbar.StatusBarView#onWindowChange} reads to
+     * decide whether *its own* icons should be light or dark for whatever app is currently on
+     * screen.
      * <p>
-     * Output format is not strictly standardised across AOSP versions/vendors. Strategy:
-     * locate the {@code mCurrentFocus=Window{... title}} line, find the matching
-     * {@code Window #N Window{... title}:} block among the per-window sections earlier in
-     * the dump, and read {@code mSystemUiVisibility} from inside that specific block. If the
-     * title match fails (format drift on some firmware), fall back to the last
+     * Output format is not strictly standardised across AOSP versions/vendors, and confirmed
+     * on a real Cityray build to NOT print {@code mCurrentFocus=} at all. Strategy, in order:
+     * <ol>
+     *   <li>{@code mCurrentFocus=Window{... title}} — the textbook AOSP field, kept first in
+     *       case some firmware still prints it.</li>
+     *   <li>{@code mObscuringWindow=Window{... title}} — confirmed present and correct on the
+     *       Cityray build that's missing #1: "the window currently obscuring the others" is,
+     *       in practice, the topmost visible one.</li>
+     *   <li>{@code mInputMethodInputTarget in display# N Window{... title}} — the window
+     *       currently receiving IME input. Less precise (can lag if nothing has focused a
+     *       text field recently) but a workable last resort.</li>
+     * </ol>
+     * Whichever title is found is matched against the {@code Window #N Window{... title}:}
+     * per-window sections earlier in the dump, and {@code mSystemUiVisibility} is read from
+     * inside that specific block. If no title source matches at all, fall back to the last
      * {@code mSystemUiVisibility} value in the whole dump — windows are listed back-to-front
-     * on every build we've seen, so the topmost/focused one tends to be last.
+     * on every build seen so far, so the topmost one tends to be last.
      * <p>
      * If this stops matching on a given firmware, log the raw {@code output} once to see the
-     * actual layout and adjust {@link #CURRENT_FOCUS_PATTERN}/{@link #WINDOW_HEADER_PATTERN}.
+     * actual layout and adjust the patterns above.
      */
     private static int parseWindowIconMode(String output) {
         List<String> headerTitles = new java.util.ArrayList<>();
@@ -209,6 +234,14 @@ public class WidgetAccessibilityService extends AccessibilityService {
 
         Matcher focusMatcher = CURRENT_FOCUS_PATTERN.matcher(output);
         String focusTitle = focusMatcher.find() ? focusMatcher.group(1) : null;
+        if (focusTitle == null) {
+            Matcher obscuringMatcher = OBSCURING_WINDOW_PATTERN.matcher(output);
+            focusTitle = obscuringMatcher.find() ? obscuringMatcher.group(1) : null;
+        }
+        if (focusTitle == null) {
+            Matcher inputTargetMatcher = INPUT_TARGET_PATTERN.matcher(output);
+            focusTitle = inputTargetMatcher.find() ? inputTargetMatcher.group(1) : null;
+        }
 
         Integer visibility = null;
         if (focusTitle != null) {
