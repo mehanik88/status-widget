@@ -145,6 +145,7 @@ public class WidgetAccessibilityService extends AccessibilityService {
         // update would have to wait for a real window change.
         seedFromCurrentWindows();
         Log.i(TAG, "Connected. Seeded " + foregroundByDisplay.size() + " display(s).");
+        fetchAndParseWindowIconMode();
         WidgetService widget = WidgetService.getInstance();
         if (widget != null) {
             widget.onForegroundTrackingPathChanged();
@@ -159,6 +160,8 @@ public class WidgetAccessibilityService extends AccessibilityService {
                 && type != AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
             return;
         }
+        Log.i(TAG, "onAccessibilityEvent: type=" + AccessibilityEvent.eventTypeToString(type)
+                + " pkg=" + event.getPackageName());
         // After any window state change, re-scan: the event itself carries one package, but
         // we want a coherent snapshot of every display, not just the one that changed. Cheap
         // — there are typically only a handful of accessibility windows in total.
@@ -182,12 +185,20 @@ public class WidgetAccessibilityService extends AccessibilityService {
      * {@link #parseWindowIconMode} for the parsing strategy and its caveats.
      */
     private void fetchAndParseWindowIconMode() {
+        Log.i(TAG, "fetchAndParseWindowIconMode: requesting dumpsys");
         PrivilegedShell.get(this).runCommand("dumpsys window windows", (output, error) -> {
-            if (output == null) return;
+            if (output == null) {
+                Log.w(TAG, "fetchAndParseWindowIconMode: no output, error=" + error);
+                return;
+            }
             int mode = parseWindowIconMode(output);
+            Log.i(TAG, "fetchAndParseWindowIconMode: parsed mode=" + mode
+                    + " (previous=" + currentWindowIconMode + "), output length=" + output.length());
             if (mode != currentWindowIconMode) {
                 currentWindowIconMode = mode;
                 WidgetService widget = WidgetService.getInstance();
+                Log.i(TAG, "fetchAndParseWindowIconMode: mode changed, widget instance="
+                        + (widget != null));
                 if (widget != null) {
                     widget.onWindowIconModeUpdated();
                 }
