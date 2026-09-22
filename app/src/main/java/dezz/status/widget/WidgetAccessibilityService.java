@@ -80,6 +80,8 @@ public class WidgetAccessibilityService extends AccessibilityService {
             Pattern.compile("Window #\\d+ Window\\{([0-9a-fA-F]+)\\s+u\\d+\\s+[^}]+\\}:");
     private static final Pattern SYSTEM_UI_VIS_PATTERN =
             Pattern.compile("mSystemUiVisibility=0x([0-9a-fA-F]+)");
+    private static final Pattern PACKAGE_PATTERN =
+            Pattern.compile("package=(\\S+)");
 
     @Nullable
     private static volatile WidgetAccessibilityService instance;
@@ -192,13 +194,14 @@ public class WidgetAccessibilityService extends AccessibilityService {
      * {@link #parseWindowIconMode} for the parsing strategy and its caveats.
      */
     private void fetchAndParseWindowIconMode() {
-        Log.i(TAG, "fetchAndParseWindowIconMode: requesting dumpsys");
+        String foregroundPkg = getForegroundPackageOnDisplay(0);
+        Log.i(TAG, "fetchAndParseWindowIconMode: requesting dumpsys, foregroundPkg=" + foregroundPkg);
         PrivilegedShell.get(this).runCommand("dumpsys window windows", (output, error) -> {
             if (output == null) {
                 Log.w(TAG, "fetchAndParseWindowIconMode: no output, error=" + error);
                 return;
             }
-            int mode = parseWindowIconMode(output);
+            int mode = parseWindowIconMode(output, foregroundPkg);
             Log.i(TAG, "fetchAndParseWindowIconMode: parsed mode=" + mode
                     + " (previous=" + currentWindowIconMode + "), output length=" + output.length());
             if (mode != currentWindowIconMode) {
@@ -220,30 +223,30 @@ public class WidgetAccessibilityService extends AccessibilityService {
      * decide whether *its own* icons should be light or dark for whatever app is currently on
      * screen.
      * <p>
-     * Output format is not strictly standardised across AOSP versions/vendors, and confirmed
-     * on a real Cityray build to NOT print {@code mCurrentFocus=} at all. Strategy, in order:
-     * <ol>
-     *   <li>{@code mCurrentFocus=Window{... title}} — the textbook AOSP field, kept first in
-     *       case some firmware still prints it.</li>
-     *   <li>{@code mObscuringWindow=Window{... title}} — confirmed present and correct on the
-     *       Cityray build that's missing #1: "the window currently obscuring the others" is,
-     *       in practice, the topmost visible one.</li>
-     *   <li>{@code mInputMethodInputTarget in display# N Window{... title}} — the window
-     *       currently receiving IME input. Less precise (can lag if nothing has focused a
-     *       text field recently) but a workable last resort.</li>
-     * </ol>
-     * Whichever hash is found is matched against the {@code Window #N Window{hash u0 ...}:}
-     * per-window sections earlier in the dump — matched by identity hash, not by title/package,
-     * since several windows can legitimately share the same title (confirmed: multiple windows
-     * plainly named "android") — and {@code mSystemUiVisibility} is read from inside that
-     * specific block. If no title source matches at all, fall back to the last
-     * {@code mSystemUiVisibility} value in the whole dump — windows are listed back-to-front
-     * on every build seen so far, so the topmost one tends to be last.
+     * Primary strategy: use {@code foregroundPkg} (from this service's own
+     * accessibility-derived {@link #foregroundByDisplay}, already relied on elsewhere and
+     * confirmed reliable) to find the window block for that package that is actually
+     * {@code isOnScreen=true}/{@code isVisible=true} right now, and read
+     * {@code mSystemUiVisibility} from inside it.
      * <p>
-     * If this stops matching on a given firmware, log the raw {@code output} once to see the
-     * actual layout and adjust the patterns above.
+     * Fallback, for when {@code foregroundPkg} is unknown (e.g. first run before any window
+     * event): the same hash-based lookup as before
+     * ({@code mCurrentFocus}/{@code mObscuringWindow}/{@code mInputMethodInputTarget}
+     * matched against {@code Window #N Window{hash u0 ...}:} headers by identity hash, never
+     * by title — several windows can legitimately share the same title, e.g. multiple windows
+     * plainly named "android"). Confirmed on a real Cityray build that {@code mCurrentFocus} is
+     * absent entirely and {@code mObscuringWindow} can stay pinned to a stale window hash
+     * indefinitely — this fallback is a second opinion, not the primary source of truth
+     * anymore.
+     * <p>
+     * Last resort if nothing above matches: the last {@code mSystemUiVisibility} value in the
+     * whole dump — windows are listed back-to-front on every build seen so far, so the topmost
+     * one tends to be last.
+     * <p>
+     * If this stops matching on a given firmware, the {@code matchedVia}/{@code visibility}
+     * log line shows exactly which strategy fired and what it read.
      */
-    private static int parseWindowIconMode(String output) {
+    private static int parseWindowIconMode(String output, @Nullable String foregroundPkg) {
         List<String> headerHashes = new java.util.ArrayList<>();
         List<int[]> headerSpans = new java.util.ArrayList<>(); // [matchStart, matchEnd]
         Matcher headerMatcher = WINDOW_HEADER_PATTERN.matcher(output);
@@ -252,34 +255,65 @@ public class WidgetAccessibilityService extends AccessibilityService {
             headerSpans.add(new int[]{headerMatcher.start(), headerMatcher.end()});
         }
 
-        Matcher focusMatcher = CURRENT_FOCUS_PATTERN.matcher(output);
-        String focusHash = focusMatcher.find() ? focusMatcher.group(1) : null;
-        if (focusHash == null) {
-            Matcher obscuringMatcher = OBSCURING_WINDOW_PATTERN.matcher(output);
-            focusHash = obscuringMatcher.find() ? obscuringMatcher.group(1) : null;
-        }
-        if (focusHash == null) {
-            Matcher inputTargetMatcher = INPUT_TARGET_PATTERN.matcher(output);
-            focusHash = inputTargetMatcher.find() ? inputTargetMatcher.group(1) : null;
-        }
-
         Integer visibility = null;
-        if (focusHash != null) {
-            for (int i = 0; i < headerHashes.size(); i++) {
-                if (!focusHash.equals(headerHashes.get(i))) continue;
+        String matchedVia = null;
+
+        // Primary strategy: find the window block that (a) belongs to the foreground package
+        // — taken from the independently-verified, already-working accessibility-derived
+        // foregroundByDisplay map, NOT from any of the dumpsys text fields below, which have
+        // been confirmed unreliable on at least one real Cityray build (mObscuringWindow can
+        // stay pinned to a stale window hash indefinitely) — and (b) is actually on screen and
+        // visible right now, not just any window belonging to that package (an app can have
+        // several: a backgrounded previous activity, a notification-listener window, etc).
+        if (foregroundPkg != null) {
+            for (int i = 0; i < headerSpans.size(); i++) {
                 int blockStart = headerSpans.get(i)[1];
                 int blockEnd = (i + 1 < headerSpans.size()) ? headerSpans.get(i + 1)[0] : output.length();
                 String block = output.substring(blockStart, Math.min(blockEnd, output.length()));
+                Matcher pkgMatcher = PACKAGE_PATTERN.matcher(block);
+                if (!pkgMatcher.find() || !foregroundPkg.equals(pkgMatcher.group(1))) continue;
+                if (!block.contains("isOnScreen=true") || !block.contains("isVisible=true")) continue;
                 Matcher visMatcher = SYSTEM_UI_VIS_PATTERN.matcher(block);
                 if (visMatcher.find()) {
                     visibility = Integer.parseInt(visMatcher.group(1), 16);
+                    matchedVia = "foregroundPkg=" + foregroundPkg;
+                    break;
                 }
-                break;
             }
         }
-        Log.i(TAG, "parseWindowIconMode: focusHash=" + focusHash
-                + " matchedHeader=" + (visibility != null) + " visibility=" + visibility);
 
+        // Fallback: the hash-based lookups (mCurrentFocus / mObscuringWindow /
+        // mInputMethodInputTarget). Kept as a second opinion for cases the primary strategy
+        // above can't cover (foregroundPkg not known yet on first run, etc).
+        if (visibility == null) {
+            Matcher focusMatcher = CURRENT_FOCUS_PATTERN.matcher(output);
+            String focusHash = focusMatcher.find() ? focusMatcher.group(1) : null;
+            if (focusHash == null) {
+                Matcher obscuringMatcher = OBSCURING_WINDOW_PATTERN.matcher(output);
+                focusHash = obscuringMatcher.find() ? obscuringMatcher.group(1) : null;
+            }
+            if (focusHash == null) {
+                Matcher inputTargetMatcher = INPUT_TARGET_PATTERN.matcher(output);
+                focusHash = inputTargetMatcher.find() ? inputTargetMatcher.group(1) : null;
+            }
+            if (focusHash != null) {
+                for (int i = 0; i < headerHashes.size(); i++) {
+                    if (!focusHash.equals(headerHashes.get(i))) continue;
+                    int blockStart = headerSpans.get(i)[1];
+                    int blockEnd = (i + 1 < headerSpans.size()) ? headerSpans.get(i + 1)[0] : output.length();
+                    String block = output.substring(blockStart, Math.min(blockEnd, output.length()));
+                    Matcher visMatcher = SYSTEM_UI_VIS_PATTERN.matcher(block);
+                    if (visMatcher.find()) {
+                        visibility = Integer.parseInt(visMatcher.group(1), 16);
+                        matchedVia = "hash=" + focusHash;
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Last resort: last mSystemUiVisibility value in the whole dump — windows are listed
+        // back-to-front on every build seen so far, so the topmost one tends to be last.
         if (visibility == null) {
             Matcher visMatcher = SYSTEM_UI_VIS_PATTERN.matcher(output);
             int last = -1;
@@ -287,11 +321,15 @@ public class WidgetAccessibilityService extends AccessibilityService {
                 last = Integer.parseInt(visMatcher.group(1), 16);
             }
             if (last == -1) {
+                Log.i(TAG, "parseWindowIconMode: no match at all (foregroundPkg=" + foregroundPkg + ")");
                 return -1;
             }
             visibility = last;
+            matchedVia = "last-in-dump";
         }
 
+        Log.i(TAG, "parseWindowIconMode: matchedVia=" + matchedVia + " visibility=0x"
+                + Integer.toHexString(visibility));
         boolean isLight = (visibility & 0x2000) != 0; // View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
         boolean isDark = (visibility & 0x4000) != 0;  // vendor dark-status-bar bit
         if (isLight) return 1;
