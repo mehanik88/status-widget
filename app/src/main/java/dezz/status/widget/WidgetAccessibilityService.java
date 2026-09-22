@@ -54,23 +54,30 @@ public class WidgetAccessibilityService extends AccessibilityService {
     private static final long ICON_MODE_DEBOUNCE_MS = 150L;
 
     private static final Pattern CURRENT_FOCUS_PATTERN =
-            Pattern.compile("mCurrentFocus=Window\\{[0-9a-fA-F]+\\s+u\\d+\\s+([^}]+)\\}");
+            Pattern.compile("mCurrentFocus=Window\\{([0-9a-fA-F]+)\\s+u\\d+\\s+[^}]+\\}");
     /**
      * Fallback #1 for firmware that doesn't print {@code mCurrentFocus} at all (confirmed on
      * one Cityray build — see git history). "The window currently obscuring the others" is,
      * in practice, the topmost visible one.
      */
     private static final Pattern OBSCURING_WINDOW_PATTERN =
-            Pattern.compile("mObscuringWindow=Window\\{[0-9a-fA-F]+\\s+u\\d+\\s+([^}]+)\\}");
+            Pattern.compile("mObscuringWindow=Window\\{([0-9a-fA-F]+)\\s+u\\d+\\s+[^}]+\\}");
     /**
      * Fallback #2: the window currently receiving IME input. Not a perfect proxy for "topmost
      * visible window" (it can lag behind if nothing has focused a text field recently), but
      * better than nothing when neither of the above is present.
      */
     private static final Pattern INPUT_TARGET_PATTERN =
-            Pattern.compile("mInputMethodInputTarget in display# \\d+ Window\\{[0-9a-fA-F]+\\s+u\\d+\\s+([^}]+)\\}");
+            Pattern.compile("mInputMethodInputTarget in display# \\d+ Window\\{([0-9a-fA-F]+)\\s+u\\d+\\s+[^}]+\\}");
+    /**
+     * Captures the window's identity hash — NOT its title. Several system windows share the
+     * exact same title (e.g. multiple windows named plain "android" — confirmed in a real
+     * dump), so matching by title can silently pick the wrong block; the hash is unique per
+     * window instance and always matches the one in {@link #CURRENT_FOCUS_PATTERN} et al. for
+     * the same window.
+     */
     private static final Pattern WINDOW_HEADER_PATTERN =
-            Pattern.compile("Window #\\d+ Window\\{[0-9a-fA-F]+\\s+u\\d+\\s+([^}]+)\\}:");
+            Pattern.compile("Window #\\d+ Window\\{([0-9a-fA-F]+)\\s+u\\d+\\s+[^}]+\\}:");
     private static final Pattern SYSTEM_UI_VIS_PATTERN =
             Pattern.compile("mSystemUiVisibility=0x([0-9a-fA-F]+)");
 
@@ -225,9 +232,11 @@ public class WidgetAccessibilityService extends AccessibilityService {
      *       currently receiving IME input. Less precise (can lag if nothing has focused a
      *       text field recently) but a workable last resort.</li>
      * </ol>
-     * Whichever title is found is matched against the {@code Window #N Window{... title}:}
-     * per-window sections earlier in the dump, and {@code mSystemUiVisibility} is read from
-     * inside that specific block. If no title source matches at all, fall back to the last
+     * Whichever hash is found is matched against the {@code Window #N Window{hash u0 ...}:}
+     * per-window sections earlier in the dump — matched by identity hash, not by title/package,
+     * since several windows can legitimately share the same title (confirmed: multiple windows
+     * plainly named "android") — and {@code mSystemUiVisibility} is read from inside that
+     * specific block. If no title source matches at all, fall back to the last
      * {@code mSystemUiVisibility} value in the whole dump — windows are listed back-to-front
      * on every build seen so far, so the topmost one tends to be last.
      * <p>
@@ -235,29 +244,29 @@ public class WidgetAccessibilityService extends AccessibilityService {
      * actual layout and adjust the patterns above.
      */
     private static int parseWindowIconMode(String output) {
-        List<String> headerTitles = new java.util.ArrayList<>();
+        List<String> headerHashes = new java.util.ArrayList<>();
         List<int[]> headerSpans = new java.util.ArrayList<>(); // [matchStart, matchEnd]
         Matcher headerMatcher = WINDOW_HEADER_PATTERN.matcher(output);
         while (headerMatcher.find()) {
-            headerTitles.add(headerMatcher.group(1));
+            headerHashes.add(headerMatcher.group(1));
             headerSpans.add(new int[]{headerMatcher.start(), headerMatcher.end()});
         }
 
         Matcher focusMatcher = CURRENT_FOCUS_PATTERN.matcher(output);
-        String focusTitle = focusMatcher.find() ? focusMatcher.group(1) : null;
-        if (focusTitle == null) {
+        String focusHash = focusMatcher.find() ? focusMatcher.group(1) : null;
+        if (focusHash == null) {
             Matcher obscuringMatcher = OBSCURING_WINDOW_PATTERN.matcher(output);
-            focusTitle = obscuringMatcher.find() ? obscuringMatcher.group(1) : null;
+            focusHash = obscuringMatcher.find() ? obscuringMatcher.group(1) : null;
         }
-        if (focusTitle == null) {
+        if (focusHash == null) {
             Matcher inputTargetMatcher = INPUT_TARGET_PATTERN.matcher(output);
-            focusTitle = inputTargetMatcher.find() ? inputTargetMatcher.group(1) : null;
+            focusHash = inputTargetMatcher.find() ? inputTargetMatcher.group(1) : null;
         }
 
         Integer visibility = null;
-        if (focusTitle != null) {
-            for (int i = 0; i < headerTitles.size(); i++) {
-                if (!focusTitle.equals(headerTitles.get(i))) continue;
+        if (focusHash != null) {
+            for (int i = 0; i < headerHashes.size(); i++) {
+                if (!focusHash.equals(headerHashes.get(i))) continue;
                 int blockStart = headerSpans.get(i)[1];
                 int blockEnd = (i + 1 < headerSpans.size()) ? headerSpans.get(i + 1)[0] : output.length();
                 String block = output.substring(blockStart, Math.min(blockEnd, output.length()));
@@ -268,6 +277,8 @@ public class WidgetAccessibilityService extends AccessibilityService {
                 break;
             }
         }
+        Log.i(TAG, "parseWindowIconMode: focusHash=" + focusHash
+                + " matchedHeader=" + (visibility != null) + " visibility=" + visibility);
 
         if (visibility == null) {
             Matcher visMatcher = SYSTEM_UI_VIS_PATTERN.matcher(output);
