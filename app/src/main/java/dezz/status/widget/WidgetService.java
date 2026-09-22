@@ -1233,8 +1233,10 @@ public class WidgetService extends Service implements WidgetHost {
     }
 
     /** Display ID our overlay's window is attached to. Defaults to {@code DEFAULT_DISPLAY}
-     *  if we can't determine it (single-display devices or pre-attach). */
-    private int currentOverlayDisplayId() {
+     *  if we can't determine it (single-display devices or pre-attach). Public so
+     *  {@link WidgetAccessibilityService} can query the correct per-display foreground
+     *  package and window state instead of assuming {@code DEFAULT_DISPLAY}. */
+    public int currentOverlayDisplayId() {
         if (binding == null) return android.view.Display.DEFAULT_DISPLAY;
         android.view.Display display = binding.getRoot().getDisplay();
         return display != null ? display.getDisplayId() : android.view.Display.DEFAULT_DISPLAY;
