@@ -82,6 +82,8 @@ public class WidgetAccessibilityService extends AccessibilityService {
             Pattern.compile("mSystemUiVisibility=0x([0-9a-fA-F]+)");
     private static final Pattern PACKAGE_PATTERN =
             Pattern.compile("package=(\\S+)");
+    private static final Pattern DISPLAY_ID_PATTERN =
+            Pattern.compile("mDisplayId=(\\d+)");
 
     @Nullable
     private static volatile WidgetAccessibilityService instance;
@@ -194,14 +196,19 @@ public class WidgetAccessibilityService extends AccessibilityService {
      * {@link #parseWindowIconMode} for the parsing strategy and its caveats.
      */
     private void fetchAndParseWindowIconMode() {
-        String foregroundPkg = getForegroundPackageOnDisplay(0);
-        Log.i(TAG, "fetchAndParseWindowIconMode: requesting dumpsys, foregroundPkg=" + foregroundPkg);
+        WidgetService widgetForDisplay = WidgetService.getInstance();
+        int displayId = widgetForDisplay != null
+                ? widgetForDisplay.currentOverlayDisplayId()
+                : android.view.Display.DEFAULT_DISPLAY;
+        String foregroundPkg = getForegroundPackageOnDisplay(displayId);
+        Log.i(TAG, "fetchAndParseWindowIconMode: requesting dumpsys, displayId=" + displayId
+                + ", foregroundPkg=" + foregroundPkg);
         PrivilegedShell.get(this).runCommand("dumpsys window windows", (output, error) -> {
             if (output == null) {
                 Log.w(TAG, "fetchAndParseWindowIconMode: no output, error=" + error);
                 return;
             }
-            int mode = parseWindowIconMode(output, foregroundPkg);
+            int mode = parseWindowIconMode(output, foregroundPkg, displayId);
             Log.i(TAG, "fetchAndParseWindowIconMode: parsed mode=" + mode
                     + " (previous=" + currentWindowIconMode + "), output length=" + output.length());
             if (mode != currentWindowIconMode) {
@@ -246,7 +253,7 @@ public class WidgetAccessibilityService extends AccessibilityService {
      * If this stops matching on a given firmware, the {@code matchedVia}/{@code visibility}
      * log line shows exactly which strategy fired and what it read.
      */
-    private static int parseWindowIconMode(String output, @Nullable String foregroundPkg) {
+    private static int parseWindowIconMode(String output, @Nullable String foregroundPkg, int displayId) {
         List<String> headerHashes = new java.util.ArrayList<>();
         List<int[]> headerSpans = new java.util.ArrayList<>(); // [matchStart, matchEnd]
         Matcher headerMatcher = WINDOW_HEADER_PATTERN.matcher(output);
@@ -272,6 +279,11 @@ public class WidgetAccessibilityService extends AccessibilityService {
                 String block = output.substring(blockStart, Math.min(blockEnd, output.length()));
                 Matcher pkgMatcher = PACKAGE_PATTERN.matcher(block);
                 if (!pkgMatcher.find() || !foregroundPkg.equals(pkgMatcher.group(1))) continue;
+                Matcher displayMatcher = DISPLAY_ID_PATTERN.matcher(block);
+                // Multi-display head units can run the same package as separate task
+                // instances on different displays at once — without this check we could match
+                // the right package on the WRONG display and read that display's flags instead.
+                if (displayMatcher.find() && Integer.parseInt(displayMatcher.group(1)) != displayId) continue;
                 if (!block.contains("isOnScreen=true") || !block.contains("isVisible=true")) continue;
                 Matcher visMatcher = SYSTEM_UI_VIS_PATTERN.matcher(block);
                 if (visMatcher.find()) {
