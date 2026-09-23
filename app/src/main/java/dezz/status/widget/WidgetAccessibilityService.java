@@ -384,15 +384,17 @@ public class WidgetAccessibilityService extends AccessibilityService {
     }
 
     /**
-     * Broader than {@link #topApplicationPackage}: also considers
-     * {@code TYPE_APPLICATION_OVERLAY} windows — launcher-style menu overlays (confirmed:
-     * GInputBridge's own app drawer draws itself this way, same pattern this app's own status
-     * bar overlay uses) are invisible to the stricter {@code TYPE_APPLICATION}-only filter used
-     * for foreground-app tracking elsewhere, so while such an overlay is on screen this method
-     * would otherwise keep reporting whatever real Activity is still running underneath it —
-     * which is exactly what caused icon-mode detection to silently use a stale/wrong package.
-     * The real system status bar doesn't have this blind spot (it reacts to whatever is
-     * topmost regardless of window type), so this method exists specifically to match that.
+     * Broader than {@link #topApplicationPackage}: also considers {@code TYPE_SYSTEM} windows
+     * — floating overlays added via {@code WindowManager} from a Service (not tied to any
+     * Activity/task, so they can't be {@code TYPE_APPLICATION}) are classified this way by the
+     * accessibility framework. Confirmed: GInputBridge's own app drawer draws itself this way,
+     * same pattern this app's own status bar overlay uses — both are invisible to the stricter
+     * {@code TYPE_APPLICATION}-only filter used for foreground-app tracking elsewhere, so while
+     * such an overlay is on screen that method would otherwise keep reporting whatever real
+     * Activity is still running underneath it — which is exactly what caused icon-mode
+     * detection to silently use a stale/wrong package. The real system status bar doesn't have
+     * this blind spot (it reacts to whatever is topmost regardless of window type), so this
+     * method exists specifically to match that.
      * <p>
      * Excludes this app's own package so we never mistake our own status-bar overlay window for
      * the foreground content.
@@ -407,7 +409,7 @@ public class WidgetAccessibilityService extends AccessibilityService {
             if (w == null) continue;
             int type = w.getType();
             if (type != AccessibilityWindowInfo.TYPE_APPLICATION
-                    && type != AccessibilityWindowInfo.TYPE_APPLICATION_OVERLAY) continue;
+                    && type != AccessibilityWindowInfo.TYPE_SYSTEM) continue;
             int layer = w.getLayer();
             if (layer <= bestLayer) continue;
             android.view.accessibility.AccessibilityNodeInfo root = w.getRoot();
