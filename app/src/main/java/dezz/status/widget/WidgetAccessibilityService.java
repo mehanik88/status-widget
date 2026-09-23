@@ -200,7 +200,7 @@ public class WidgetAccessibilityService extends AccessibilityService {
         int displayId = widgetForDisplay != null
                 ? widgetForDisplay.currentOverlayDisplayId()
                 : android.view.Display.DEFAULT_DISPLAY;
-        String foregroundPkg = getForegroundPackageOnDisplay(displayId);
+        String foregroundPkg = getTopVisiblePackageForIconMode(displayId);
         Log.i(TAG, "fetchAndParseWindowIconMode: requesting dumpsys, displayId=" + displayId
                 + ", foregroundPkg=" + foregroundPkg);
         PrivilegedShell.get(this).runCommand("dumpsys window windows", (output, error) -> {
@@ -381,6 +381,70 @@ public class WidgetAccessibilityService extends AccessibilityService {
             foregroundByDisplay.clear();
             foregroundByDisplay.putAll(next);
         }
+    }
+
+    /**
+     * Broader than {@link #topApplicationPackage}: also considers
+     * {@code TYPE_APPLICATION_OVERLAY} windows — launcher-style menu overlays (confirmed:
+     * GInputBridge's own app drawer draws itself this way, same pattern this app's own status
+     * bar overlay uses) are invisible to the stricter {@code TYPE_APPLICATION}-only filter used
+     * for foreground-app tracking elsewhere, so while such an overlay is on screen this method
+     * would otherwise keep reporting whatever real Activity is still running underneath it —
+     * which is exactly what caused icon-mode detection to silently use a stale/wrong package.
+     * The real system status bar doesn't have this blind spot (it reacts to whatever is
+     * topmost regardless of window type), so this method exists specifically to match that.
+     * <p>
+     * Excludes this app's own package so we never mistake our own status-bar overlay window for
+     * the foreground content.
+     */
+    @Nullable
+    private String topVisibleWindowPackageForIconMode(@Nullable List<AccessibilityWindowInfo> windows) {
+        if (windows == null) return null;
+        String ownPackage = getPackageName();
+        AccessibilityWindowInfo best = null;
+        int bestLayer = Integer.MIN_VALUE;
+        for (AccessibilityWindowInfo w : windows) {
+            if (w == null) continue;
+            int type = w.getType();
+            if (type != AccessibilityWindowInfo.TYPE_APPLICATION
+                    && type != AccessibilityWindowInfo.TYPE_APPLICATION_OVERLAY) continue;
+            int layer = w.getLayer();
+            if (layer <= bestLayer) continue;
+            android.view.accessibility.AccessibilityNodeInfo root = w.getRoot();
+            if (root == null) continue;
+            try {
+                CharSequence pkg = root.getPackageName();
+                if (pkg == null || ownPackage.equals(pkg.toString())) continue;
+                bestLayer = layer;
+                best = w;
+            } finally {
+                root.recycle();
+            }
+        }
+        if (best == null) return null;
+        android.view.accessibility.AccessibilityNodeInfo root = best.getRoot();
+        if (root == null) return null;
+        try {
+            CharSequence pkg = root.getPackageName();
+            return pkg == null ? null : pkg.toString();
+        } finally {
+            root.recycle();
+        }
+    }
+
+    /**
+     * Same display-selection logic as {@link #seedFromCurrentWindows} (API 30+ per-display via
+     * {@link #getWindowsOnAllDisplays()}, older API single-display via {@link #getWindows()}),
+     * but using {@link #topVisibleWindowPackageForIconMode} instead of the stricter
+     * {@link #topApplicationPackage} — see that method's javadoc for why.
+     */
+    @Nullable
+    private String getTopVisiblePackageForIconMode(int displayId) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            android.util.SparseArray<List<AccessibilityWindowInfo>> all = getWindowsOnAllDisplays();
+            return topVisibleWindowPackageForIconMode(all.get(displayId));
+        }
+        return topVisibleWindowPackageForIconMode(getWindows());
     }
 
     /**
