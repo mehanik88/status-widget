@@ -18,10 +18,6 @@
 package dezz.status.widget;
 
 import android.accessibilityservice.AccessibilityService;
-import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
-import android.graphics.Color;
-import android.graphics.Rect;
 import android.os.Build;
 import android.util.Log;
 import android.view.accessibility.AccessibilityEvent;
@@ -29,7 +25,6 @@ import android.view.accessibility.AccessibilityWindowInfo;
 
 import androidx.annotation.Nullable;
 
-import java.io.File;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -49,42 +44,76 @@ import dezz.status.widget.shell.PrivilegedShell;
  * 2) Drive the "follow wallpaper" window-icon-mode override for {@link WidgetService}: instead
  * of trying to independently re-derive which window is "really" on top and what color the
  * stock status bar decided for it (both proved unreliable across firmware quirks — see git
- * history: absent {@code mCurrentFocus}, stale {@code mObscuringWindow}, non-existent
- * {@code AccessibilityWindowInfo.TYPE_APPLICATION_OVERLAY}, overlay windows invisible to
- * foreground-app tracking...), this simply screenshots the exact pixel region where a stock
- * status bar icon (Bluetooth, chosen because it's always present) is drawn and reads its actual
- * rendered color directly. Whatever produced that color — wallpaper luminance, per-window
- * flags, some other mechanism entirely — doesn't matter: we copy the real, already-correct
- * result instead of re-deriving it.
+ * history: absent {@code mCurrentFocus}, stale {@code mObscuringWindow}, overlay windows
+ * invisible to foreground-app tracking...), this reads the actual rendered color of a real
+ * stock status bar icon (Bluetooth, chosen because it's always present) directly off the
+ * live framebuffer. Whatever produced that color — wallpaper luminance, per-window flags, some
+ * other mechanism entirely — doesn't matter: we copy the real, already-correct result instead
+ * of re-deriving it.
+ * <p>
+ * Getting that single pixel is done with a single lightweight shell one-liner, no screenshot
+ * file involved:
+ * <pre>{@code
+ * screencap | dd bs=<offset> skip=1 2>/dev/null | dd bs=4 count=1 2>/dev/null | od -An -tu1
+ * }</pre>
+ * {@code screencap} with no {@code -p} dumps the raw framebuffer (16-byte header — width,
+ * height, format, dataspace, each a little-endian int32 — confirmed on this exact firmware,
+ * followed by row-major RGBA8888 pixel data) straight to its stdout with no PNG encoding at
+ * all; the first {@code dd} skips straight to the byte offset of the one pixel we care about
+ * in a single block read (a byte-at-a-time {@code skip} was tried first and stalls badly
+ * piping from a live process — this is why it's split into two {@code dd} calls, not one with
+ * both {@code bs} and {@code skip} together), the second {@code dd} takes just its 4 bytes
+ * (R,G,B,A), and {@code od} turns those into plain decimal text. The whole point: this result
+ * is a handful of short text numbers, which is exactly what a text-oriented telnet shell
+ * channel is fine with — unlike a PNG file, which needs writing to disk, reading back, and
+ * decoding, and was confirmed to be the dominant cost of the earlier screenshot-based
+ * approach (not the network round trip). This is cheap enough that it doesn't need a kept-open
+ * connection either — plain {@link PrivilegedShell#runCommand} (which opens and closes a fresh
+ * connection per call) is fine, and leaves the telnet channel free for other apps using it in
+ * between captures.
  */
 public class WidgetAccessibilityService extends AccessibilityService {
     private static final String TAG = "WidgetA11yService";
 
     /** Debounce window for {@link #captureAndSampleIconColor()} — TYPE_WINDOWS_CHANGED can
-     * fire in quick bursts (scrolling, keyboard) and a screencap + decode is relatively heavy
-     * to do on every single one. */
+     * fire in quick bursts (scrolling, keyboard) and there's no need to run a fresh pixel probe
+     * on every single one. */
     private static final long ICON_MODE_DEBOUNCE_MS = 150L;
 
     /**
-     * A single point deep inside the stock Bluetooth icon's stroke, in real device pixels
-     * (1440x1920 panel). Measured directly from an actual uncompressed screenshot: found the
+     * A point deep inside the stock Bluetooth icon's stroke, in real device pixels (confirmed
+     * 1440x1920 panel). Measured directly from an actual uncompressed screenshot: found the
      * darkest pixel cluster in the icon's bounding box, then eroded that mask by one pixel so
-     * the chosen point sits well inside the stroke's thickness rather than on its edge — this
-     * keeps the probe robust to a pixel or two of calibration drift on a different unit/build,
-     * since the stroke has real width around this point in every direction, not just at this
-     * exact coordinate. A tiny neighborhood around it (see {@link #PROBE_RADIUS}) is averaged
-     * rather than reading this one pixel alone, as a further guard against a single noisy
-     * pixel. Bluetooth was chosen because it's always present regardless of connection/signal
-     * state (unlike the Wi-Fi/GPS icons, which can visually change shape).
+     * the chosen point sits well inside the stroke's thickness rather than on its edge — keeps
+     * the probe robust to a pixel or two of calibration drift, since the stroke has real width
+     * around this point in every direction, not just at this exact coordinate. Bluetooth was
+     * chosen because it's always present regardless of connection/signal state (unlike the
+     * Wi-Fi/GPS icons, which can visually change shape).
      */
-    private static final int PROBE_CENTER_X = 1269;
-    private static final int PROBE_CENTER_Y = 47;
-    private static final int PROBE_RADIUS = 1; // samples a (2*RADIUS+1)^2 = 3x3 block
+    private static final int PROBE_X = 1269;
+    private static final int PROBE_Y = 47;
 
-    /** Below this luminance (0-255) the sampled point reads as a dark stroke (drawn dark-on-
+    /** Panel width in pixels — needed to convert (x,y) into a byte offset into the raw
+     * framebuffer dump (row-major, so offset = header + (y*width + x) * bytesPerPixel). */
+    private static final int SCREEN_WIDTH = 1440;
+
+    /** Raw {@code screencap} (no {@code -p}) header size in bytes on this firmware — confirmed
+     * by manually dumping the first 16 bytes and reading them as four little-endian int32
+     * fields (width, height, format, dataspace): {@code 1440 1920 1 1}. Some Android versions
+     * omit the trailing dataspace field (12-byte header) — if this ever needs recalibrating for
+     * a different firmware build, dump the first 16 bytes the same way and check whether the
+     * third field (pixel format, normally 1 = RGBA_8888) repeats correctly at byte 12 (16-byte
+     * header) or byte 8 (12-byte header).
+     */
+    private static final int RAW_HEADER_BYTES = 16;
+
+    private static final int BYTES_PER_PIXEL = 4; // RGBA_8888
+
+    /** Below this luminance (0-255) the sampled pixel reads as a dark stroke (drawn dark-on-
      * light, i.e. the background behind the status bar is light) → mode 1. Above it, a light
      * stroke (drawn light-on-dark) → mode 2. Safe to use a plain midpoint threshold here
-     * because the probe point is guaranteed to be pure stroke, not a stroke/background mix. */
+     * because the probe point is confirmed to sit deep inside the icon's own stroke, not in a
+     * gap showing background through — see {@link #PROBE_X}/{@link #PROBE_Y}. */
     private static final int LUMINANCE_THRESHOLD = 128;
 
     @Nullable
@@ -98,7 +127,7 @@ public class WidgetAccessibilityService extends AccessibilityService {
     private final Runnable captureIconColorRunnable = this::captureAndSampleIconColor;
 
     /**
-     * -1 = unknown (no sample yet, or capture/decode failed), 0 = neutral (unused by the
+     * -1 = unknown (no sample yet, or capture/parse failed), 0 = neutral (unused by the
      * pixel-sampling approach — kept for API compatibility with {@link WidgetService}), 1 =
      * light background (dark icon sampled), 2 = dark background (light icon sampled).
      */
@@ -178,9 +207,9 @@ public class WidgetAccessibilityService extends AccessibilityService {
         // — there are typically only a handful of accessibility windows in total.
         seedFromCurrentWindows();
 
-        // Debounced: a screencap+decode is comparatively heavy, and bursts of
-        // TYPE_WINDOWS_CHANGED (scrolling, keyboard) would otherwise trigger it far more often
-        // than the on-screen icon color could plausibly have changed.
+        // Debounced: bursts of TYPE_WINDOWS_CHANGED (scrolling, keyboard) would otherwise
+        // trigger a fresh pixel probe far more often than the on-screen icon color could
+        // plausibly have changed.
         debounceHandler.removeCallbacks(captureIconColorRunnable);
         debounceHandler.postDelayed(captureIconColorRunnable, ICON_MODE_DEBOUNCE_MS);
 
@@ -191,44 +220,22 @@ public class WidgetAccessibilityService extends AccessibilityService {
     }
 
     /**
-     * Screenshots the whole panel via the privileged shell channel, decodes just the probe
-     * rectangle over the stock Bluetooth icon, and derives light/dark mode from its actual
-     * rendered color. See the class javadoc for why this replaced the earlier
-     * dumpsys-window-parsing approach.
+     * Runs the {@code screencap | dd | dd | od} one-liner (see the class javadoc for the full
+     * breakdown) and derives light/dark mode from the resulting pixel's luminance.
      */
     private void captureAndSampleIconColor() {
-        File externalDir = getExternalFilesDir(null);
-        if (externalDir == null) {
-            Log.w(TAG, "captureAndSampleIconColor: getExternalFilesDir(null) returned null, skipping");
-            return;
-        }
-        File probeFile = new File(externalDir, "probe.png");
-        String path = probeFile.getAbsolutePath();
-        // Written via the app's own external files dir: the root shell (running as a different
-        // UID over telnet) can write there freely, and this app can always read its own
-        // external files dir back with zero storage permissions, regardless of scoped-storage
-        // rules on newer Android versions — sidesteps needing any binary transfer over the
-        // (text-oriented) telnet shell channel entirely.
-        String cmd = "screencap -p " + path;
-        Log.i(TAG, "captureAndSampleIconColor: requesting screencap to " + path);
+        long offset = (long) RAW_HEADER_BYTES + ((long) PROBE_Y * SCREEN_WIDTH + PROBE_X) * BYTES_PER_PIXEL;
+        String cmd = "screencap | dd bs=" + offset + " skip=1 2>/dev/null"
+                + " | dd bs=" + BYTES_PER_PIXEL + " count=1 2>/dev/null | od -An -tu1";
         PrivilegedShell.get(this).runCommand(cmd, (output, error) -> {
-            if (!probeFile.exists() || probeFile.length() == 0) {
-                Log.w(TAG, "captureAndSampleIconColor: probe file missing/empty, error=" + error);
+            if (output == null) {
+                Log.w(TAG, "captureAndSampleIconColor: no output, error=" + error);
                 return;
             }
-            Bitmap bmp = BitmapFactory.decodeFile(path);
-            if (bmp == null) {
-                Log.w(TAG, "captureAndSampleIconColor: BitmapFactory.decodeFile failed for " + path);
-                return;
-            }
-            int mode;
-            try {
-                mode = sampleIconMode(bmp);
-            } finally {
-                bmp.recycle();
-            }
+            int mode = parsePixelMode(output);
             Log.i(TAG, "captureAndSampleIconColor: parsed mode=" + mode
-                    + " (previous=" + currentWindowIconMode + ")");
+                    + " (previous=" + currentWindowIconMode + ") raw=[" + output.trim() + "]");
+            if (mode == -1) return;
             if (mode != currentWindowIconMode) {
                 currentWindowIconMode = mode;
                 WidgetService widget = WidgetService.getInstance();
@@ -242,42 +249,26 @@ public class WidgetAccessibilityService extends AccessibilityService {
     }
 
     /**
-     * Averages a small {@code (2*PROBE_RADIUS+1)}-square block of pixels centered on
-     * {@link #PROBE_CENTER_X}/{@link #PROBE_CENTER_Y} — a point confirmed to sit well inside
-     * the Bluetooth icon's stroke, not in a gap between strokes — and compares it against
-     * {@link #LUMINANCE_THRESHOLD}. Unlike sampling the icon's whole bounding box (which mixes
-     * stroke and background-through-the-gaps into a washed-out, unreliable average — confirmed
-     * on real measured data: ~113 against a bright teal background, dangerously close to the
-     * threshold), this small block is guaranteed pure stroke, so a plain average is reliable.
-     * Returns -1 if the point falls outside the actual bitmap (wrong resolution assumption).
+     * Parses the {@code od -An -tu1} output — plain decimal bytes separated by whitespace,
+     * e.g. {@code " 250 252 255 255"} for R,G,B,A — and derives light/dark mode from the
+     * luminance of the first three (RGB, alpha unused).
      */
-    private static int sampleIconMode(Bitmap bmp) {
-        Rect probe = new Rect(
-                PROBE_CENTER_X - PROBE_RADIUS, PROBE_CENTER_Y - PROBE_RADIUS,
-                PROBE_CENTER_X + PROBE_RADIUS + 1, PROBE_CENTER_Y + PROBE_RADIUS + 1);
-        Rect bounds = new Rect(0, 0, bmp.getWidth(), bmp.getHeight());
-        if (!bounds.contains(probe)) {
-            Log.w(TAG, "sampleIconMode: probe " + probe + " outside bitmap " + bounds
-                    + " — PROBE_CENTER_* likely needs recalibrating for this resolution");
+    private static int parsePixelMode(String output) {
+        String[] parts = output.trim().split("\\s+");
+        if (parts.length < 3) {
+            Log.w(TAG, "parsePixelMode: unexpected output format: [" + output.trim() + "]");
             return -1;
         }
-        long sum = 0;
-        int count = 0;
-        for (int y = probe.top; y < probe.bottom; y++) {
-            for (int x = probe.left; x < probe.right; x++) {
-                int px = bmp.getPixel(x, y);
-                if (Color.alpha(px) < 128) continue; // fully/mostly transparent, skip
-                sum += (int) (0.299 * Color.red(px) + 0.587 * Color.green(px) + 0.114 * Color.blue(px));
-                count++;
-            }
-        }
-        if (count == 0) {
-            Log.w(TAG, "sampleIconMode: probe block fully transparent — recheck PROBE_CENTER_*");
+        try {
+            int r = Integer.parseInt(parts[0]);
+            int g = Integer.parseInt(parts[1]);
+            int b = Integer.parseInt(parts[2]);
+            int luminance = (int) (0.299 * r + 0.587 * g + 0.114 * b);
+            return luminance < LUMINANCE_THRESHOLD ? 1 : 2;
+        } catch (NumberFormatException e) {
+            Log.w(TAG, "parsePixelMode: failed to parse numbers from [" + output.trim() + "]", e);
             return -1;
         }
-        int avgLuminance = (int) (sum / count);
-        Log.i(TAG, "sampleIconMode: avgLuminance=" + avgLuminance + " over " + count + " px");
-        return avgLuminance < LUMINANCE_THRESHOLD ? 1 : 2;
     }
 
     @Override
