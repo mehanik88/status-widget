@@ -54,7 +54,7 @@ import dezz.status.widget.shell.PrivilegedShell;
  * Getting that single pixel is done with a single lightweight shell one-liner, no screenshot
  * file involved:
  * <pre>{@code
- * screencap | dd bs=<offset> skip=1 2>/dev/null | dd bs=4 count=1 2>/dev/null | od -An -tu1
+ * screencap|dd bs=<offset> skip=1|dd bs=4 count=1|od -An -tu1|sed 's/^/PXVAL:/'
  * }</pre>
  * {@code screencap} with no {@code -p} dumps the raw framebuffer (16-byte header — width,
  * height, format, dataspace, each a little-endian int32 — confirmed on this exact firmware,
@@ -63,10 +63,16 @@ import dezz.status.widget.shell.PrivilegedShell;
  * in a single block read (a byte-at-a-time {@code skip} was tried first and stalls badly
  * piping from a live process — this is why it's split into two {@code dd} calls, not one with
  * both {@code bs} and {@code skip} together), the second {@code dd} takes just its 4 bytes
- * (R,G,B,A), and {@code od} turns those into plain decimal text. The whole point: this result
- * is a handful of short text numbers, which is exactly what a text-oriented telnet shell
- * channel is fine with — unlike a PNG file, which needs writing to disk, reading back, and
- * decoding, and was confirmed to be the dominant cost of the earlier screenshot-based
+ * (R,G,B,A), {@code od} turns those into plain decimal text, and {@code sed} tags the result
+ * line with a {@code PXVAL:} marker. The command is kept this terse — no spaces around pipes,
+ * no {@code 2>/dev/null} redirects — because a longer, more readable version of it was
+ * confirmed to line-wrap in the interactive telnet terminal, and that wrap's echo (cursor
+ * control sequences included) got captured as part of the "output" right along with the real
+ * result; the marker means {@link #parsePixelMode} doesn't need the whole output to be clean,
+ * just finds that tag and reads the numbers after it. The whole point of this approach: the
+ * result is a handful of short text numbers, which is exactly what a text-oriented telnet
+ * shell channel is fine with — unlike a PNG file, which needs writing to disk, reading back,
+ * and decoding, and was confirmed to be the dominant cost of the earlier screenshot-based
  * approach (not the network round trip). This is cheap enough that it doesn't need a kept-open
  * connection either — plain {@link PrivilegedShell#runCommand} (which opens and closes a fresh
  * connection per call) is fine, and leaves the telnet channel free for other apps using it in
@@ -225,8 +231,15 @@ public class WidgetAccessibilityService extends AccessibilityService {
      */
     private void captureAndSampleIconColor() {
         long offset = (long) RAW_HEADER_BYTES + ((long) PROBE_Y * SCREEN_WIDTH + PROBE_X) * BYTES_PER_PIXEL;
-        String cmd = "screencap | dd bs=" + offset + " skip=1 2>/dev/null"
-                + " | dd bs=" + BYTES_PER_PIXEL + " count=1 2>/dev/null | od -An -tu1";
+        // Kept as short and marker-tagged as possible: a longer, spaced-out version of this
+        // command (with "2>/dev/null" redirects and spaces around every pipe) was confirmed to
+        // wrap across lines in the interactive telnet terminal, and that line-wrap echo (with
+        // its backspace/cursor-control sequences) ended up captured as part of the "output"
+        // instead of the actual result. The "PXVAL:" marker means the parser below doesn't
+        // need the whole output to be clean — it just finds this exact tag and reads the
+        // numbers right after it, ignoring whatever command-echo noise precedes it.
+        String cmd = "screencap|dd bs=" + offset + " skip=1|dd bs=" + BYTES_PER_PIXEL
+                + " count=1|od -An -tu1|sed 's/^/PXVAL:/'";
         PrivilegedShell.get(this).runCommand(cmd, (output, error) -> {
             if (output == null) {
                 Log.w(TAG, "captureAndSampleIconColor: no output, error=" + error);
@@ -249,14 +262,24 @@ public class WidgetAccessibilityService extends AccessibilityService {
     }
 
     /**
-     * Parses the {@code od -An -tu1} output — plain decimal bytes separated by whitespace,
-     * e.g. {@code " 250 252 255 255"} for R,G,B,A — and derives light/dark mode from the
-     * luminance of the first three (RGB, alpha unused).
+     * Finds the {@code PXVAL:} marker the shell command tags its real result with (see
+     * {@link #captureAndSampleIconColor}) and parses the plain decimal bytes right after it —
+     * e.g. {@code "PXVAL: 250 252 255 255"} for R,G,B,A — ignoring anything before the marker
+     * (confirmed: the interactive telnet terminal can echo the command itself, with
+     * line-wrap/cursor-control noise, into the captured output — the marker means that noise
+     * never needs to be cleaned up, just skipped past). Derives light/dark mode from the
+     * luminance of the first three numbers found (RGB, alpha unused).
      */
     private static int parsePixelMode(String output) {
-        String[] parts = output.trim().split("\\s+");
+        int markerIdx = output.indexOf("PXVAL:");
+        if (markerIdx == -1) {
+            Log.w(TAG, "parsePixelMode: no PXVAL marker in output: [" + output.trim() + "]");
+            return -1;
+        }
+        String tail = output.substring(markerIdx + "PXVAL:".length()).trim();
+        String[] parts = tail.split("\\s+");
         if (parts.length < 3) {
-            Log.w(TAG, "parsePixelMode: unexpected output format: [" + output.trim() + "]");
+            Log.w(TAG, "parsePixelMode: unexpected data after marker: [" + tail + "]");
             return -1;
         }
         try {
@@ -266,7 +289,7 @@ public class WidgetAccessibilityService extends AccessibilityService {
             int luminance = (int) (0.299 * r + 0.587 * g + 0.114 * b);
             return luminance < LUMINANCE_THRESHOLD ? 1 : 2;
         } catch (NumberFormatException e) {
-            Log.w(TAG, "parsePixelMode: failed to parse numbers from [" + output.trim() + "]", e);
+            Log.w(TAG, "parsePixelMode: failed to parse numbers from [" + tail + "]", e);
             return -1;
         }
     }
